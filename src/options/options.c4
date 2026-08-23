@@ -1,0 +1,1032 @@
+use std::list as list
+use std::memory::allocators::bump as allocator
+
+use diagnostic::diagnostic as diagnostic
+
+
+
+diagnostic::DiagnosticEngine *globalDiagnosticEngine = null
+
+fn init_error_reporting(diagnostic::Diagnostic *diagnosticEngine){
+    globalDiagnosticEngine = diagnosticEngine
+}
+
+fn report_error(char *errorMessage){
+    diagnostic::DiagnosticEngine *tmpDiagnosticEngine = globalDiagnosticEngine
+    tmpDiagnosticEngine->report_error(errorMessage)
+}
+
+
+const u32 TRUE  = 1
+const u32 FALSE = 0
+
+
+
+
+// The C4 name's changes depending on the context(which can be confusing at times,or maybe not...hmm)
+// C4 can refer to the entire language ecosystem
+// C4 can also refer to the unsafe profile of C4 Language Ecosystem
+// Of course all these depend on the context,right...hmmm
+
+// C4 is meant to be more than just a programming language
+// We are designing it as an ecosystem built around a common language core with different profiles for different use cases
+// The main C4 profile is a low-level systems language with full control over memory and hardware
+// Profiles like C4S impose stronger compile-time safety restrictions and can target environments such as native systems, a VM, or JavaScript
+// The idea is that these aren’t completely separate languages—they share the same syntax, compiler infrastructure, type system, libraries, package ecosystem, and tooling
+// However, the profile determines what capabilities and guarantees are available
+// This lets the same ecosystem scale from kernel/embedded development to safe application development and scripting without fragmenting into unrelated languages
+// Ideally,the main problem we want solved is coherence
+
+// Profiles are not back ends
+// A profile answers:
+//                  What is this program allowed to do, and what guarantees does the compiler enforce?
+// A backend answers:
+//                  What does this program compile to?
+// A platform answers:
+//                  Where does it run?
+
+// Sweet!!!!
+
+
+// Profile system
+//
+// C4 is a language *core* shared across profiles
+// A profile determines which capabilities are available and which environments it may target
+// Adding a new profile means adding a ProfileKind + a default capability mask
+// ie. it should never require touching Target, Optimization or the backend structs
+
+enum ProfileKind{
+    None      
+    C4       // full systems profile: raw memory, hardware, assembly instructions
+    C4S      // safety-restricted profile: native, VM, or JS environments
+    Unknown
+}
+
+enum TargetEnvironment{
+    None
+    Native       // real hardware / OS, produces object code via an assembler
+    VM           // c4's own bytecode VM
+    JavaScript   // transpiles to JS
+    Unknown
+}
+
+
+// These are the C4's Capability bitflags
+// We use a u64 bitmask rather than one bool field per capability.
+// This is to make sure that adding a new capability only requires adding a constant
+// The alternative would require adding a new field plus touching every init call site
+// Of course this limits the number of capabilities C4 has,but that shouldn't be a problem
+// I THINK!!!!!!!!! 
+
+const u64 CAPABILITY_NONE                        = 0
+const u64 CAPABILITY_RAW_POINTERS                = 1 << 0
+const u64 CAPABILITY_POINTER_ARITHMETIC          = 1 << 1
+const u64 CAPABILITY_INLINE_ASM                  = 1 << 2
+const u64 CAPABILITY_FOREIGN_FFI                 = 1 << 3
+const u64 CAPABILITY_UNSAFE_BLOCKS               = 1 << 4
+const u64 CAPABILITY_MANUAL_MEMORY_MANAGEMENT    = 1 << 5
+const u64 CAPABILITY_HARDWARE_IO                 = 1 << 6
+const u64 CAPABILITY_NO_STD                      = 1 << 7
+const u64 CAPABILITY_PACKED_STRUCTS              = 1 << 8
+const u64 CAPABILITY_UNCHECKED_ARITHMETIC        = 1 << 9
+const u64 CAPABILITY_GLOBAL_MUTABLE_STATE        = 1 << 10
+const u64 CAPABILITY_UNION_TYPES                 = 1 << 11
+const u64 CAPABILITY_CUSTOM_ALLOCATORS           = 1 << 12
+const u64 CAPABILITY_INTERRUPT_HANDLERS          = 1 << 13
+
+const u64 CAPABILITY_ALL =
+    CAPABILITY_RAW_POINTERS             |
+    CAPABILITY_POINTER_ARITHMETIC       |
+    CAPABILITY_INLINE_ASM               |
+    CAPABILITY_FOREIGN_FFI              |
+    CAPABILITY_UNSAFE_BLOCKS            |
+    CAPABILITY_MANUAL_MEMORY_MANAGEMENT |
+    CAPABILITY_HARDWARE_IO              |
+    CAPABILITY_NO_STD                   |
+    CAPABILITY_PACKED_STRUCTS           |
+    CAPABILITY_UNCHECKED_ARITHMETIC     |
+    CAPABILITY_GLOBAL_MUTABLE_STATE     |
+    CAPABILITY_UNION_TYPES              |
+    CAPABILITY_CUSTOM_ALLOCATORS        |
+    CAPABILITY_INTERRUPT_HANDLERS
+
+
+// These capabilities are physically meaningless once you leave real hardware
+// They are force-cleared for VM/JavaScript environments regardless of profile
+// See Profile::validate() method for more details
+
+const u64 CAPABILITY_NATIVE_ONLY_MASK =
+    CAPABILITY_RAW_POINTERS             |
+    CAPABILITY_POINTER_ARITHMETIC       |
+    CAPABILITY_INLINE_ASM               |
+    CAPABILITY_HARDWARE_IO              |
+    CAPABILITY_MANUAL_MEMORY_MANAGEMENT |
+    CAPABILITY_INTERRUPT_HANDLERS       |
+    CAPABILITY_UNCHECKED_ARITHMETIC
+
+
+// This describes the ceiling of what C4S is ever allowed to enable, on any environment
+// C4S may turn capabilities OFF freely, but may never turn on anything outside this mask
+// This is "not-surprisingly" enforced in Profile::validate() method
+
+const u64 CAPABILITY_C4S_ALLOWED_MASK =
+    CAPABILITY_FOREIGN_FFI       |
+    CAPABILITY_CUSTOM_ALLOCATORS |
+    CAPABILITY_UNION_TYPES
+
+
+// We use a struct for easy manipulation
+// This is a pattern you'll see often in this codebase
+// We prefer,by WE i mean I prefer to avoid magic names
+// And write self-documenting code,well,as self-documenting as it can be
+// HMM....
+
+struct Capabilities{
+    u64 flags
+}
+
+impl Capabilities{
+    fn init(){
+        self->flags = CAPABILITY_NONE
+    }
+
+    fn init_from_mask(u64 flags){
+        self->flags = flags
+    }
+
+    fn has(u64 capability)->u32{
+        return (self->flags & capability) != 0
+    }
+
+    fn enable(u64 capability){
+        self->flags |= capability
+    }
+
+    fn disable(u64 capability){
+        self->flags &= ~capability
+    }
+
+    fn get_flags()->u64{
+        return self->flags
+    }
+
+    fn set_flags(u64 flags){
+        self->flags = flags
+    }
+}
+
+
+
+// This is the default capability mask for a freshly-created profile of this kind
+// Callers should still go through the Profile::validate() after any manual enable()/disable() calls
+// This is because validate is what actually enforces the C4S ceiling and the native-only clearing,which just picks a sane starting point
+
+fn default_capabilities_for_kind(ProfileKind kind)->u64{
+    if kind == ProfileKind::C4{
+        return CAPABILITY_ALL
+    }
+    elif kind == ProfileKind::C4S{
+        return CAPABILITY_C4S_ALLOWED_MASK
+    }
+
+    return CAPABILITY_NONE
+}
+
+
+struct Profile{
+    ProfileKind kind
+    TargetEnvironment environment
+    Capabilities capabilities
+}
+
+impl Profile{
+    fn init(){
+        self->kind        = ProfileKind::None
+        self->environment = TargetEnvironment::None
+
+        Capabilities capabilities
+        capabilities.init()
+        self->capabilities = capabilities
+    }
+
+    fn set_kind(ProfileKind kind){
+        self->kind = kind
+    }
+
+    fn get_kind()->ProfileKind{
+        return self->kind
+    }
+
+    fn set_environment(TargetEnvironment environment){
+        self->environment = environment
+    }
+
+    fn get_environment()->TargetEnvironment{
+        return self->environment
+    }
+
+    fn get_capabilities_reference()->Capabilities *{
+        return &self->capabilities
+    }
+
+    fn has_capability(u64 capability)->u32{
+        return self->capabilities.Has(capability)
+    }
+
+    fn apply_default_capabilities(){
+        self->capabilities.set_flags(default_capabilities_for_kind(self->kind))
+    }
+
+    fn is_safety_restricted()->u32{
+        return self->kind == ProfileKind::C4S
+    }
+
+    fn allows_environment(TargetEnvironment environment)->u32{
+        if self->kind == ProfileKind::C4{
+            return environment == TargetEnvironment::Native
+        }
+        elif self->kind == ProfileKind::C4S{
+            return    (environment == TargetEnvironment::Native)
+                   or (environment == TargetEnvironment::VM)
+                   or (environment == TargetEnvironment::JavaScript)
+        }
+
+        return FALSE
+    }
+
+    // This method is the heart of enforcing the profiles correctness
+    // It returns TRUE if the profile is internally consistent
+    // It Reports human-readable errors and force-corrects the capability mask in place
+    // This is done by clearing anything that isn't actually permitted
+    // This has the interesting effect that a caller that ignores the return value still ends up with a *safe* configuration
+    // It is worth noting that this may not be what the user intended configuration
+    // This prevents setting a silently over-privileged capability
+
+    fn validate()->u32{
+        u32 valid = TRUE
+
+        if self->kind == ProfileKind::None or self->kind == ProfileKind::Unknown{
+            report_error("error: no profile selected (expected c4 or c4s)\n")
+            valid = FALSE
+        }
+
+        if not self->allows_environment(self->environment){
+            report_error("error: selected profile does not support the requested target environment\n")
+            valid = FALSE
+        }
+
+        if self->environment != TargetEnvironment::Native{
+            u64 flags = self->capabilities.get_flags()
+
+            if (flags & CAPABILITY_NATIVE_ONLY_MASK) != 0{
+                report_error("error: hardware/native-only capabilities cannot be enabled for a VM or JavaScript target; disabling them\n")
+                self->capabilities.set_flags(flags & ~CAPABILITY_NATIVE_ONLY_MASK)
+                valid = FALSE
+            }
+        }
+
+        if self->kind == ProfileKind::C4S{
+            u64 flags = self->capabilities.get_flags()
+
+            if (flags & ~CAPABILITY_C4S_ALLOWED_MASK) != 0{
+                report_error("error: c4s profile has capabilities enabled beyond its safety ceiling; disabling them\n")
+                self->capabilities.set_flags(flags & CAPABILITY_C4S_ALLOWED_MASK)
+                valid = FALSE
+            }
+        }
+
+        return valid
+    }
+}
+
+
+
+// The fields are grouped by environment
+// Only the group matching the active `TargetEnvironment` should be populated
+// ie. Target::validate() method enforces this rather than trusting callers to leave the others at None
+// This aligns with the principles of this codebase,specifically never trusting the user
+// But above all,always adhering to the principle of least privilege
+
+enum TargetArchitecture{
+    None
+    X86_16
+    X86_64
+    ARM
+    AARCH64
+    Unknown
+}
+
+enum TargetOS{
+    None
+    Linux
+    Windows
+    BareMetal
+    Unknown
+}
+
+enum TargetAssembler{
+    None
+    Nasm
+    NasmShellcode
+    Gas
+    Masm
+    GnuC
+    Unknown
+}
+
+enum VMTarget{
+    None
+    C4VM
+    Unknown
+}
+
+enum JSTarget{
+    None
+    ES5
+    ES2015
+    ES2020
+    Unknown
+}
+
+
+struct Target{
+    TargetEnvironment environment
+
+    // This is only valid for native target
+    TargetArchitecture architecture
+    TargetOS os
+    TargetAssembler assembler
+
+    // This is only valid for C4VM targets
+    VMTarget vmTarget
+
+    // This is only valid for javascript targets
+    JSTarget jsTarget
+}
+
+impl Target{
+    fn init(){
+        self->environment  = TargetEnvironment::None
+
+        self->architecture = TargetArchitecture::None
+        self->os           = TargetOS::None
+        self->assembler    = TargetAssembler::None
+
+        self->vmTarget     = VMTarget::None
+
+        self->jsTarget     = JSTarget::None
+    }
+
+    fn set_environment(TargetEnvironment environment){
+        self->environment = environment
+    }
+
+    fn get_environment()->TargetEnvironment{
+        return self->environment
+    }
+
+    fn set_architecture(TargetArchitecture architecture){
+        self->architecture = architecture
+    }
+
+    fn get_architecture()->TargetArchitecture{
+        return self->architecture
+    }
+
+    fn set_os(TargetOS os){
+        self->os = os
+    }
+
+    fn get_os()->TargetOS{
+        return self->os
+    }
+
+    fn set_assembler(TargetAssembler assembler){
+        self->assembler = assembler
+    }
+
+    fn get_assembler()->TargetAssembler{
+        return self->assembler
+    }
+
+    fn set_vm_target(VMTarget vmTarget){
+        self->vmTarget = vmTarget
+    }
+
+    fn get_vm_target()->VMTarget{
+        return self->vmTarget
+    }
+
+    fn set_js_target(JSTarget jsTarget){
+        self->jsTarget = jsTarget
+    }
+
+    fn get_js_target()->JSTarget{
+        return self->jsTarget
+    }
+
+    // This method confirms that only the field group matching `environment` is populated
+    // It also makes sure that the active group isn't left at its None/default value
+
+    fn validate()->u32{
+        u32 valid = TRUE
+
+        if self->environment == TargetEnvironment::Native{
+            if self->architecture == TargetArchitecture::None{
+                report_error("error: native target requires an architecture\n")
+                valid = FALSE
+            }
+            if self->os == TargetOS::None{
+                report_error("error: native target requires an os\n")
+                valid = FALSE
+            }
+            if self->vmTarget != VMTarget::None{
+                report_error("error: vm target set on a native target\n")
+                valid = FALSE
+            }
+            if self->jsTarget != JSTarget::None{
+                report_error("error: js target set on a native target\n")
+                valid = FALSE
+            }
+        }
+        elif self->environment == TargetEnvironment::VM{
+            if self->vmTarget == VMTarget::None{
+                report_error("error: vm target requires a vm target kind\n")
+                valid = FALSE
+            }
+            if self->architecture != TargetArchitecture::None{
+                report_error("error: architecture set on a vm target\n")
+                valid = FALSE
+            }
+            if self->assembler != TargetAssembler::None{
+                report_error("error: assembler set on a vm target\n")
+                valid = FALSE
+            }
+        }
+        elif self->environment == TargetEnvironment::JavaScript{
+            if self->jsTarget == JSTarget::None{
+                report_error("error: javascript target requires an ecmascript version\n")
+                valid = FALSE
+            }
+            if self->architecture != TargetArchitecture::None{
+                report_error("error: architecture set on a javascript target\n")
+                valid = FALSE
+            }
+            if self->assembler != TargetAssembler::None{
+                report_error("error: assembler set on a javascript target\n")
+                valid = FALSE
+            }
+        }
+        else{
+            report_error("error: no target environment selected\n")
+            valid = FALSE
+        }
+
+        return valid
+    }
+}
+
+
+struct FrontEndOptions{
+    str inputFileName
+    str inputFileSource
+    str tokensOutputFileName
+    u32 emitTokens
+    u32 emitAST
+    u32 lexOnly
+    u32 parseOnly
+}
+
+impl FrontEndOptions{
+    fn init(){
+        self->inputFileName       = ""
+        self->inputFileSource     = ""
+        self->tokensOutputFileName = ""
+        self->emitTokens          = FALSE
+        self->emitAST             = FALSE
+        self->lexOnly             = FALSE
+        self->parseOnly           = FALSE
+    }
+
+    fn set_input_file_name(str inputFileName){
+        self->inputFileName = inputFileName
+    }
+
+    fn get_input_file_name()->str{
+        return self->inputFileName
+    }
+
+    fn set_input_file_source(str inputFileSource){
+        self->inputFileSource = inputFileSource
+    }
+
+    fn get_input_file_source()->str{
+        return self->inputFileSource
+    }
+
+    fn set_tokens_output_file_name(str tokensOutputFileName){
+        self->tokensOutputFileName = tokensOutputFileName
+    }
+
+    fn get_tokens_output_file_name()->str{
+        return self->tokensOutputFileName
+    }
+
+    fn set_emit_tokens(u32 emitTokens){
+        self->emitTokens = emitTokens
+    }
+
+    fn get_emit_okens()->u32{
+        return self->emitTokens
+    }
+
+    fn set_emit_ast(u32 emitAST){
+        self->emitAST = emitAST
+    }
+
+    fn get_emit_ast()->u32{
+        return self->emitAST
+    }
+
+    fn set_lex_only(u32 lexOnly){
+        self->lexOnly = lexOnly
+    }
+
+    fn get_lex_only()->u32{
+        return self->lexOnly
+    }
+
+    fn set_parse_only(u32 parseOnly){
+        self->parseOnly = parseOnly
+    }
+
+    fn get_parse_only()->u32{
+        return self->parseOnly
+    }
+
+    fn validate()->u32{
+        if self->lexOnly and self->parseOnly{
+            report_error("error: -lex-only and -parse-only are mutually exclusive\n")
+            return FALSE
+        }
+
+        return TRUE
+    }
+}
+
+
+
+const u64 OPTIMIZATION_NONE                          = 0
+const u64 OPTIMIZATION_CONSTANT_FOLDING               = 1 << 0
+const u64 OPTIMIZATION_UNREACHABLE_CODE_ELIMINATION   = 1 << 1
+const u64 OPTIMIZATION_COPY_PROPAGATION               = 1 << 2
+const u64 OPTIMIZATION_DEAD_STORE_ELIMINATION         = 1 << 3
+const u64 OPTIMIZATION_DEAD_CODE_ELIMINATION          = 1 << 4
+
+const u64 OPTIMIZATION_LEVEL_O1 =
+    OPTIMIZATION_CONSTANT_FOLDING |
+    OPTIMIZATION_DEAD_CODE_ELIMINATION
+
+const u64 OPTIMIZATION_LEVEL_O2 =
+    OPTIMIZATION_LEVEL_O1                       |
+    OPTIMIZATION_COPY_PROPAGATION               |
+    OPTIMIZATION_DEAD_STORE_ELIMINATION         |
+    OPTIMIZATION_UNREACHABLE_CODE_ELIMINATION
+
+
+struct Optimization{
+    u64 flags
+}
+
+impl Optimization{
+    fn init(){
+        self->flags = OPTIMIZATION_NONE
+    }
+
+    fn init_from_mask(u64 flags){
+        self->flags = flags
+    }
+
+    fn has(u64 optimization)->u32{
+        return (self->flags & optimization) != 0
+    }
+
+    fn enable(u64 optimization){
+        self->flags |= optimization
+    }
+
+    fn disable(u64 optimization){
+        self->flags &= ~optimization
+    }
+
+    fn get_flags()->u64{
+        return self->flags
+    }
+
+    fn set_flags(u64 flags){
+        self->flags = flags
+    }
+}
+
+
+struct MiddleEndOptions{
+    Optimization optimization
+    u32 emitC
+    u32 emitC4IL
+    u32 emitCFG
+    u32 verifyC4IL
+    str c4ILOutputFileName
+    u32 c4ILOnly
+}
+
+impl MiddleEndOptions{
+    fn init(){
+        Optimization optimization
+        optimization.init()
+
+        self->optimization       = optimization
+        self->emitC              = FALSE
+        self->emitC4IL           = FALSE
+        self->emitCFG            = FALSE
+        self->verifyC4IL         = FALSE
+        self->c4ILOutputFileName = ""
+        self->c4ILOnly           = FALSE
+    }
+
+    fn get_optimization_reference()->Optimization *{
+        return &self->optimization
+    }
+
+    fn set_emit_c(u32 emitC){
+        self->emitC = emitC
+    }
+
+    fn get_emit_c()->u32{
+        return self->emitC
+    }
+
+    fn set_emit_c4il(u32 emitC4IL){
+        self->emitC4IL = emitC4IL
+    }
+
+    fn get_emit_c4il()->u32{
+        return self->emitC4IL
+    }
+
+    fn set_emit_cfg(u32 emitCFG){
+        self->emitCFG = emitCFG
+    }
+
+    fn get_emit_cfg()->u32{
+        return self->emitCFG
+    }
+
+    fn set_verify_c4il(u32 verifyC4IL){
+        self->verifyC4IL = verifyC4IL
+    }
+
+    fn get_verify_c4il()->u32{
+        return self->verifyC4IL
+    }
+
+    fn set_c4il_output_file_name(str c4ILOutputFileName){
+        self->c4ILOutputFileName = c4ILOutputFileName
+    }
+
+    fn get_c4il_output_file_name()->str{
+        return self->c4ILOutputFileName
+    }
+
+    fn set_c4il_only(u32 c4ILOnly){
+        self->c4ILOnly = c4ILOnly
+    }
+
+    fn get_c4il_only()->u32{
+        return self->c4ILOnly
+    }
+}
+
+struct X86Options{
+    u32 useRedZone
+    u32 omitFramePointer
+    u32 positionIndependent
+}
+
+impl X86Options{
+    fn init(){
+        self->useRedZone          = FALSE
+        self->omitFramePointer    = FALSE
+        self->positionIndependent = FALSE
+    }
+
+    fn set_use_red_zone(u32 useRedZone){
+        self->useRedZone = useRedZone
+    }
+
+    fn get_use_red_zone()->u32{
+        return self->useRedZone
+    }
+
+    fn set_omit_frame_pointer(u32 omitFramePointer){
+        self->omitFramePointer = omitFramePointer
+    }
+
+    fn get_omit_frame_pointer()->u32{
+        return self->omitFramePointer
+    }
+
+    fn set_position_independent(u32 positionIndependent){
+        self->positionIndependent = positionIndependent
+    }
+
+    fn get_position_independent()->u32{
+        return self->positionIndependent
+    }
+}
+
+
+struct BackendOptions{
+    u32 emitASM
+    u32 compileOnly
+    u32 assembleOnly
+    X86Options x86_64
+    str asmOutputFileName
+}
+
+impl BackendOptions{
+    fn init(){
+        X86Options x86_64
+        x86_64.init()
+
+        self->emitASM          = FALSE
+        self->compileOnly      = FALSE
+        self->assembleOnly     = FALSE
+        self->x86_64           = x86_64
+        self->asmOutputFileName = ""
+    }
+
+    fn set_emit_asm(u32 emitASM){
+        self->emitASM = emitASM
+    }
+
+    fn get_emit_asm()->u32{
+        return self->emitASM
+    }
+
+    fn set_compile_only(u32 compileOnly){
+        self->compileOnly = compileOnly
+    }
+
+    fn get_compile_only()->u32{
+        return self->compileOnly
+    }
+
+    fn set_assemble_only(u32 assembleOnly){
+        self->assembleOnly = assembleOnly
+    }
+
+    fn get_assemble_only()->u32{
+        return self->assembleOnly
+    }
+
+    fn get_x86_options_reference()->X86Options *{
+        return &self->x86_64
+    }
+
+    fn set_asm_output_file_name(str asmOutputFileName){
+        self->asmOutputFileName = asmOutputFileName
+    }
+
+    fn get_asm_output_file_name()->str{
+        return self->asmOutputFileName
+    }
+
+    fn validate()->u32{
+        if self->compileOnly and self->assembleOnly{
+            report_error("error: -c and -assemble-only are mutually exclusive\n")
+            return FALSE
+        }
+
+        return TRUE
+    }
+}
+
+
+// Output
+
+enum EmitType{
+    None
+    Library
+    Executable
+    Unknown
+}
+
+struct OutputOptions{
+    EmitType emitType
+    str outputFileName
+    list::List asmFiles
+}
+
+impl OutputOptions{
+    fn init(allocator::BumpAllocator *bump){
+        self->emitType      = EmitType::None
+        self->outputFileName = ""
+
+        self->asmFiles.init(bump)
+    }
+
+    fn set_emit_type(EmitType emitType){
+        self->emitType = emitType
+    }
+
+    fn get_emit_type()->EmitType{
+        return self->emitType
+    }
+
+    fn set_output_file_name(str outputFileName){
+        self->outputFileName = outputFileName
+    }
+
+    fn get_output_file_name()->str{
+        return self->outputFileName
+    }
+
+    fn get_asm_files_reference()->list::List *{
+        return &self->asmFiles
+    }
+}
+
+
+
+struct Options{
+    Profile profile
+    Target target
+    FrontEndOptions frontEnd
+    MiddleEndOptions middleEnd
+    BackendOptions backEnd
+    OutputOptions output
+}
+
+impl Options{
+    fn init(allocator::BumpAllocator *bump){
+        Profile profile
+        profile.init()
+
+        Target target
+        target.init()
+
+        FrontEndOptions frontEnd
+        frontEnd.init()
+
+        MiddleEndOptions middleEnd
+        middleEnd.init()
+
+        BackendOptions backEnd
+        backEnd.init()
+
+        OutputOptions output
+        output.init(bump)
+
+        self->profile  = profile
+        self->target   = target
+        self->frontEnd = frontEnd
+        self->middleEnd = middleEnd
+        self->backEnd  = backEnd
+        self->output   = output
+    }
+
+    fn get_profile_reference()->Profile *{
+        return &self->profile
+    }
+
+    fn get_target_reference()->Target *{
+        return &self->target
+    }
+
+    fn get_front_end_reference()->FrontEndOptions *{
+        return &self->frontEnd
+    }
+
+    fn get_middle_end_reference()->MiddleEndOptions *{
+        return &self->middleEnd
+    }
+
+    fn get_back_end_reference()->BackendOptions *{
+        return &self->backEnd
+    }
+
+    fn get_output_reference()->OutputOptions *{
+        return &self->output
+    }
+
+    // This is like the code that connects everything together,The glue
+    // It runs every stage's validate() methods
+    // This ensures that callers get one entry point that catches contradictory flag combinations before compilation starts,
+    // rather than each stage discovering the contradiction independently partway through a run
+    
+    fn validate()->u32{
+        u32 valid = TRUE
+
+        if not self->profile.validate(){
+            valid = FALSE
+        }
+
+        // The Target's environment is driven by the profile, not chosen independently
+        // Thus,we keep them in lockstep before validating.
+        
+        self->target.set_environment(self->profile.get_environment())
+
+        if not self->target.validate(){
+            valid = FALSE
+        }
+
+        if not self->frontEnd.validate(){
+            valid = FALSE
+        }
+
+        if not self->backEnd.validate(){
+            valid = FALSE
+        }
+
+        return valid
+    }
+}
+
+
+struct Compiler{
+    Options options
+    allocator::BumpAllocator *bump
+    str inputFile
+    u64 globalCounter
+}
+
+impl Compiler{
+    fn init(Options options,allocator::BumpAllocator *bump,str inputFile){
+        self->options       = options
+        self->bump          = bump
+        self->inputFile     = inputFile
+        self->globalCounter = 0
+    }
+
+    // This is the single monotonic ID source for the whole pipeline
+    // We prefer having a single source of truth,thus preventing a certain class of bugs
+    // The front end,middle end, and backend all call this rather than each keeping their own counter
+    // Therefore there's exactly one number line and no synchronization to get wrong between stages
+    // I THINK!!!...hmm
+
+    fn next_global_id()->u64{
+        u64 id = self->globalCounter
+
+        self->globalCounter += 1
+
+        return id
+    }
+
+    fn get_global_counter()->u64{
+        return self->globalCounter
+    }
+
+    fn get_options_reference()->Options *{
+        return &self->options
+    }
+
+    fn get_target_assembler()->TargetAssembler{
+        return self->options.target.get_assembler()
+    }
+
+    fn get_target_environment()->TargetEnvironment{
+        return self->options.target.get_environment()
+    }
+
+    // Only a Native target with a real assembler goes through the traditional emit-asm/assemble/link backend
+    // VM ,JavaScript and other transpiled targets never touch TargetAssembler at all
+    // They instead lower straight from C4IL to bytecode or to JS source or to the transpiled Source respectively
+
+    fn ShouldBackend()->u32{
+        if self->GetTargetEnvironment() != TargetEnvironment::Native{
+            return FALSE
+        }
+
+        TargetAssembler assembler = self->GetTargetAssembler()
+
+        return (assembler != TargetAssembler::None)
+               and (assembler != TargetAssembler::GnuC)
+               and (assembler != TargetAssembler::Unknown)
+    }
+
+    fn should_emit_javascript()->u32{
+        return self->get_target_environment() == TargetEnvironment::JavaScript
+    }
+
+    fn should_emit_vm_bytecode()->u32{
+        return self->get_target_environment() == TargetEnvironment::VM
+    }
+
+    fn is_safety_restricted()->u32{
+        return self->options.profile.is_safety_restricted()
+    }
+
+    fn has_capability(u64 capability)->u32{
+        return self->options.profile.has_capability(capability)
+    }
+}
