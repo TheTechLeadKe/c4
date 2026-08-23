@@ -1,0 +1,6 @@
+[build]
+input    = "src/main.c4"
+output   = "app"
+target   = "x86_64-linux-gnuC"
+emitC    = true
+#[build]
