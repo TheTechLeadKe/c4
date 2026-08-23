@@ -1002,12 +1002,12 @@ impl Compiler{
     // VM ,JavaScript and other transpiled targets never touch TargetAssembler at all
     // They instead lower straight from C4IL to bytecode or to JS source or to the transpiled Source respectively
 
-    fn ShouldBackend()->u32{
-        if self->GetTargetEnvironment() != TargetEnvironment::Native{
+    fn should_backend()->u32{
+        if self->get_target_environment() != TargetEnvironment::Native{
             return FALSE
         }
 
-        TargetAssembler assembler = self->GetTargetAssembler()
+        TargetAssembler assembler = self->get_target_assembler()
 
         return (assembler != TargetAssembler::None)
                and (assembler != TargetAssembler::GnuC)
